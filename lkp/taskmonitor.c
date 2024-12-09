@@ -1,5 +1,6 @@
 #include "asm-generic/errno-base.h"
 #include "linux/blk-mq.h"
+#include "linux/container_of.h"
 #include "linux/err.h"
 #include "linux/fs.h"
 #include "linux/gfp_types.h"
@@ -23,6 +24,8 @@
 #include "linux/kernel.h"
 #include "linux/init.h"
 
+#include "linux/shrinker.h"
+
 MODULE_DESCRIPTION("A module for monitoring a target task");
 MODULE_AUTHOR("Jonas Dohmen");
 MODULE_LICENSE("GPL");
@@ -33,6 +36,7 @@ struct task_monitor {
 	struct mutex mutex;
 	struct list_head samples;
 	unsigned long sample_count;
+	struct shrinker samples_shrinker;
 };
 
 struct task_sample {
@@ -76,7 +80,7 @@ static ssize_t sysfs_store_taskmonitor(struct kobject *,
 static struct kobj_attribute taskmonitor_attr = __ATTR(
 	taskmonitor, 0600, sysfs_show_taskmonitor, sysfs_store_taskmonitor);
 
-//IOCTL AREA
+// IOCTL AREA
 
 static int major_number;
 static long ioctl_call(struct file *, unsigned int, unsigned long);
@@ -84,11 +88,19 @@ static const struct file_operations taskmonitor_fops = { .owner = THIS_MODULE,
 							 .unlocked_ioctl =
 								 ioctl_call };
 
+// SHRINKER AREA
+
+static unsigned long taskmonitor_count_objects(struct shrinker *,
+					       struct shrink_control *);
+static unsigned long taskmonitor_scan_objects(struct shrinker *,
+					      struct shrink_control *);
+
 // FUNCTION AREA
 
 static struct task_monitor *taskmonitor_new(void)
 {
 	struct task_monitor *tmp_taskmon;
+	int err;
 
 	tmp_taskmon = kzalloc(sizeof(struct task_monitor), GFP_KERNEL);
 	if (!tmp_taskmon)
@@ -97,6 +109,18 @@ static struct task_monitor *taskmonitor_new(void)
 	mutex_init(&tmp_taskmon->mutex);
 	INIT_LIST_HEAD(&tmp_taskmon->samples);
 
+	tmp_taskmon->samples_shrinker.count_objects = taskmonitor_count_objects;
+	tmp_taskmon->samples_shrinker.scan_objects = taskmonitor_scan_objects;
+	tmp_taskmon->samples_shrinker.batch = 0;
+	tmp_taskmon->samples_shrinker.seeks = DEFAULT_SEEKS;
+
+	err = register_shrinker(&tmp_taskmon->samples_shrinker, "taskmonitor");
+	if (err) {
+		mutex_destroy(&tmp_taskmon->mutex);
+		kfree(tmp_taskmon);
+		return ERR_PTR(err);
+	}
+
 	return tmp_taskmon;
 }
 
@@ -104,6 +128,7 @@ static void taskmonitor_free(struct task_monitor *p_taskmonitor)
 {
 	taskmonitor_stop(p_taskmonitor);
 	taskmonitor_unset_pid(p_taskmonitor);
+	unregister_shrinker(&p_taskmonitor->samples_shrinker);
 	mutex_destroy(&p_taskmonitor->mutex);
 	kfree(p_taskmonitor);
 }
@@ -154,17 +179,22 @@ static void taskmonitor_unset_pid(struct task_monitor *p_taskmonitor)
 static void taskmonitor_add_sample(struct task_monitor *p_taskmonitor,
 				   struct task_sample *p_sample)
 {
+	mutex_lock(&p_taskmonitor->mutex);
 	p_taskmonitor->sample_count++;
 	list_add_tail(&p_sample->list, &p_taskmonitor->samples);
+	mutex_unlock(&p_taskmonitor->mutex);
 }
 
 static void taskmonitor_clear_samples(struct task_monitor *p_taskmonitor)
 {
 	struct task_sample *sample, *tmp;
+	mutex_lock(&p_taskmonitor->mutex);
 	list_for_each_entry_safe(sample, tmp, &p_taskmonitor->samples, list) {
-		//list_del(&sample->list);
+		list_del(&sample->list);
 		taskmonitor_free_sample(sample);
+		p_taskmonitor->sample_count--;
 	}
+	mutex_unlock(&p_taskmonitor->mutex);
 }
 
 static void taskmonitor_free_sample(struct task_sample *p_sample)
@@ -371,6 +401,47 @@ static long ioctl_call(struct file *p_file, unsigned int p_cmd,
 	default:
 		return -ENOTTY;
 	}
+}
+
+static unsigned long taskmonitor_count_objects(struct shrinker *p_sh,
+					       struct shrink_control *p_sc)
+{
+	struct task_monitor *taskmonitor =
+		container_of(p_sh, struct task_monitor, samples_shrinker);
+	unsigned long count;
+
+	mutex_lock(&taskmonitor->mutex);
+	count = taskmonitor->sample_count ? taskmonitor->sample_count :
+					    SHRINK_EMPTY;
+	mutex_unlock(&taskmonitor->mutex);
+
+	return count;
+}
+
+static unsigned long taskmonitor_scan_objects(struct shrinker *p_sh,
+					      struct shrink_control *p_sc)
+{
+	struct task_monitor *taskmonitor =
+		container_of(p_sh, struct task_monitor, samples_shrinker);
+	struct task_sample *sample, *next;
+	unsigned long count = 0;
+
+	if (!mutex_trylock(&taskmonitor->mutex))
+		return SHRINK_STOP;
+
+	list_for_each_entry_safe(sample, next, &taskmonitor->samples, list) {
+		if (p_sc->nr_to_scan-- == 0)
+			break;
+
+		list_del(&sample->list);
+		taskmonitor_free_sample(sample);
+		taskmonitor->sample_count--;
+		count++;
+	}
+
+	mutex_unlock(&taskmonitor->mutex);
+
+	return count;
 }
 
 module_param_named(target, target_param, int, 0660);
