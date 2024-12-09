@@ -23,7 +23,6 @@
 #include "taskmonitor.h"
 #include "linux/kernel.h"
 #include "linux/init.h"
-
 #include "linux/shrinker.h"
 
 MODULE_DESCRIPTION("A module for monitoring a target task");
@@ -37,6 +36,7 @@ struct task_monitor {
 	struct list_head samples;
 	unsigned long sample_count;
 	struct shrinker samples_shrinker;
+	struct kmem_cache *samples_cache;
 };
 
 struct task_sample {
@@ -121,6 +121,14 @@ static struct task_monitor *taskmonitor_new(void)
 		return ERR_PTR(err);
 	}
 
+	tmp_taskmon->samples_cache =
+		kmem_cache_create("task_sample", sizeof(struct task_sample),
+				  __alignof__(struct task_sample), 0, NULL);
+	if (!tmp_taskmon->samples_cache) {
+		err = -ENOMEM;
+		return ERR_PTR(err);
+	}
+
 	return tmp_taskmon;
 }
 
@@ -129,6 +137,7 @@ static void taskmonitor_free(struct task_monitor *p_taskmonitor)
 	taskmonitor_stop(p_taskmonitor);
 	taskmonitor_unset_pid(p_taskmonitor);
 	unregister_shrinker(&p_taskmonitor->samples_shrinker);
+	kmem_cache_destroy(p_taskmonitor->samples_cache);
 	mutex_destroy(&p_taskmonitor->mutex);
 	kfree(p_taskmonitor);
 }
@@ -199,7 +208,7 @@ static void taskmonitor_clear_samples(struct task_monitor *p_taskmonitor)
 
 static void taskmonitor_free_sample(struct task_sample *p_sample)
 {
-	kfree(p_sample);
+	kmem_cache_free(glob_taskmonitor->samples_cache, p_sample);
 }
 
 static struct task_sample *
@@ -217,7 +226,7 @@ taskmonitor_new_sample(struct task_monitor *p_taskmonitor)
 	if (!pid_alive(tmp_task))
 		goto err_pid_alive;
 
-	ret = kzalloc(sizeof(struct task_sample), GFP_KERNEL);
+	ret = kmem_cache_alloc(p_taskmonitor->samples_cache, GFP_KERNEL);
 	if (!ret)
 		goto err_pid_alive;
 
