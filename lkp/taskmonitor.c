@@ -1,11 +1,13 @@
 #include "asm-generic/errno-base.h"
 #include "linux/blk-mq.h"
 #include "linux/container_of.h"
+#include "linux/dcache.h"
 #include "linux/err.h"
 #include "linux/fs.h"
 #include "linux/gfp_types.h"
 #include "linux/jiffies.h"
 #include "linux/kobject.h"
+#include "linux/kstrtox.h"
 #include "linux/kthread.h"
 #include "linux/list.h"
 #include "linux/module.h"
@@ -18,7 +20,6 @@
 #include "linux/slab.h"
 #include "linux/stddef.h"
 #include "linux/string.h"
-#include "linux/sysfs.h"
 #include "linux/types.h"
 #include "linux/uaccess.h"
 #include "taskmonitor.h"
@@ -34,15 +35,23 @@ MODULE_DESCRIPTION("A module for monitoring a target task");
 MODULE_AUTHOR("Jonas Dohmen");
 MODULE_LICENSE("GPL");
 
+struct taskmonitor_controller {
+	struct dentry *root_dir;
+	struct mutex mutex;
+	struct list_head list;
+};
+
 struct task_monitor {
 	struct pid *pid;
-	struct task_struct *thread;
 	struct mutex mutex;
 	struct list_head samples;
 	unsigned long sample_count;
 	struct shrinker samples_shrinker;
 	struct kmem_cache *samples_cache;
 	mempool_t sample_pool;
+	struct dentry *file;
+
+	struct list_head list;
 };
 
 struct task_sample {
@@ -54,11 +63,12 @@ struct task_sample {
 	unsigned long stack;
 	struct list_head list;
 	struct kref ref;
+	struct task_monitor *monitor;
 };
 
 // FORWARD DECLARATION AREA
 
-static struct task_monitor *taskmonitor_new(void);
+static struct task_monitor *taskmonitor_new(const char *, struct dentry *);
 static void taskmonitor_free(struct task_monitor *);
 
 static int taskmonitor_set_pid(struct task_monitor *, pid_t);
@@ -69,33 +79,12 @@ static void taskmonitor_clear_samples(struct task_monitor *);
 static void taskmonitor_free_sample(struct task_sample *);
 static struct task_sample *taskmonitor_new_sample(struct task_monitor *);
 
-static int taskmonitor_start(struct task_monitor *);
-static void taskmonitor_stop(struct task_monitor *);
 static int taskmonitor_threadfunc(void *);
 
 // VARIABLE AREA
 
-static int target_param; //the parameter to set pid at startup
-static struct task_monitor *glob_taskmonitor;
-static struct dentry *taskmonitor_debugfs;
-
-// SYSFS AREA
-
-static ssize_t sysfs_show_taskmonitor(struct kobject *, struct kobj_attribute *,
-				      char *);
-static ssize_t sysfs_store_taskmonitor(struct kobject *,
-				       struct kobj_attribute *, const char *,
-				       size_t);
-static struct kobj_attribute taskmonitor_attr = __ATTR(
-	taskmonitor, 0600, sysfs_show_taskmonitor, sysfs_store_taskmonitor);
-
-// IOCTL AREA
-
-static int major_number;
-static long ioctl_call(struct file *, unsigned int, unsigned long);
-static const struct file_operations taskmonitor_fops = { .owner = THIS_MODULE,
-							 .unlocked_ioctl =
-								 ioctl_call };
+static struct taskmonitor_controller monitor_controller;
+static struct task_struct *taskmonitor_thread;
 
 // SHRINKER AREA
 
@@ -112,11 +101,16 @@ static int taskmonitor_sample_put(struct task_sample *);
 
 // SEQ_FILE AREA
 
+static struct dentry *taskmonitor_debugfs_control;
+
 static void *taskmonitor_seq_start(struct seq_file *, loff_t *);
 static void *taskmonitor_seq_next(struct seq_file *, void *, loff_t *);
 static void taskmonitor_seq_stop(struct seq_file *, void *);
 static int taskmonitor_seq_show(struct seq_file *, void *);
 static int taskmonitor_open(struct inode *, struct file *);
+
+static ssize_t taskmonitor_control_write(struct file *, const char *, size_t,
+					 loff_t *);
 
 static const struct file_operations taskmonitor_debugfs_ops = {
 	.owner = THIS_MODULE,
@@ -133,16 +127,31 @@ static const struct seq_operations taskmonitor_seq_operations = {
 	.show = taskmonitor_seq_show,
 };
 
+static const struct file_operations taskmonitor_control_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = taskmonitor_control_write,
+	.llseek = no_llseek,
+};
+
 // FUNCTION AREA
 
-static struct task_monitor *taskmonitor_new(void)
+static struct task_monitor *taskmonitor_new(const char *p_pid_str,
+					    struct dentry *p_dentry)
 {
 	struct task_monitor *tmp_taskmon;
 	int err;
+	pid_t tmp_pid;
+
+	err = kstrtoint(p_pid_str, 0, &tmp_pid);
+	if (err)
+		goto err_no_allocs;
 
 	tmp_taskmon = kzalloc(sizeof(struct task_monitor), GFP_KERNEL);
-	if (!tmp_taskmon)
-		return tmp_taskmon;
+	if (!tmp_taskmon) {
+		err = -ENOMEM;
+		goto err_no_allocs;
+	}
 
 	mutex_init(&tmp_taskmon->mutex);
 	INIT_LIST_HEAD(&tmp_taskmon->samples);
@@ -168,8 +177,22 @@ static struct task_monitor *taskmonitor_new(void)
 	if (err)
 		goto err_mempool;
 
-	return tmp_taskmon;
+	err = taskmonitor_set_pid(tmp_taskmon, tmp_pid);
+	if (err)
+		goto err_set_pid;
 
+	tmp_taskmon->file = debugfs_create_file(p_pid_str, 0444, p_dentry,
+						tmp_taskmon,
+						&taskmonitor_debugfs_ops);
+	if (IS_ERR(tmp_taskmon->file)) {
+		err = PTR_ERR(tmp_taskmon->file);
+		goto err_set_pid;
+	}
+
+	return tmp_taskmon;
+err_set_pid:
+	taskmonitor_unset_pid(tmp_taskmon);
+	mempool_exit(&tmp_taskmon->sample_pool);
 err_mempool:
 	kmem_cache_destroy(tmp_taskmon->samples_cache);
 err_kmem:
@@ -177,12 +200,13 @@ err_kmem:
 err_shrinker:
 	mutex_destroy(&tmp_taskmon->mutex);
 	kfree(tmp_taskmon);
+err_no_allocs:
 	return ERR_PTR(err);
 }
 
 static void taskmonitor_free(struct task_monitor *p_taskmonitor)
 {
-	taskmonitor_stop(p_taskmonitor);
+	debugfs_remove(p_taskmonitor->file);
 	taskmonitor_unset_pid(p_taskmonitor);
 	unregister_shrinker(&p_taskmonitor->samples_shrinker);
 	mempool_exit(&p_taskmonitor->sample_pool);
@@ -195,11 +219,6 @@ static int taskmonitor_set_pid(struct task_monitor *p_taskmonitor,
 			       pid_t p_pid_nr)
 {
 	struct pid *tmp_pid;
-	bool restart = false;
-	int err = 0;
-
-	if (p_taskmonitor->thread)
-		restart = true;
 
 	tmp_pid = find_get_pid(p_pid_nr);
 	if (IS_ERR(tmp_pid))
@@ -208,16 +227,9 @@ static int taskmonitor_set_pid(struct task_monitor *p_taskmonitor,
 	if (!tmp_pid)
 		return -EINVAL;
 
-	taskmonitor_stop(p_taskmonitor);
 	taskmonitor_unset_pid(p_taskmonitor);
 
 	p_taskmonitor->pid = tmp_pid;
-
-	if (restart) {
-		err = taskmonitor_start(p_taskmonitor);
-		if (err)
-			return err;
-	}
 
 	return 0;
 }
@@ -237,11 +249,9 @@ static void taskmonitor_unset_pid(struct task_monitor *p_taskmonitor)
 static void taskmonitor_add_sample(struct task_monitor *p_taskmonitor,
 				   struct task_sample *p_sample)
 {
-	mutex_lock(&p_taskmonitor->mutex);
 	taskmonitor_sample_get(p_sample);
 	p_taskmonitor->sample_count++;
 	list_add_tail(&p_sample->list, &p_taskmonitor->samples);
-	mutex_unlock(&p_taskmonitor->mutex);
 }
 
 static void taskmonitor_clear_samples(struct task_monitor *p_taskmonitor)
@@ -258,7 +268,7 @@ static void taskmonitor_clear_samples(struct task_monitor *p_taskmonitor)
 
 static void taskmonitor_free_sample(struct task_sample *p_sample)
 {
-	mempool_free(p_sample, &glob_taskmonitor->sample_pool);
+	mempool_free(p_sample, &p_sample->monitor->sample_pool);
 }
 
 static struct task_sample *
@@ -285,9 +295,13 @@ taskmonitor_new_sample(struct task_monitor *p_taskmonitor)
 	ret->pid = pid_nr(p_taskmonitor->pid);
 	ret->utime = tmp_task->utime;
 	ret->stime = tmp_task->stime;
-	ret->total = tmp_task->mm->total_vm;
-	ret->stack = tmp_task->mm->stack_vm;
-	ret->data = tmp_task->mm->data_vm;
+	if (tmp_task->mm) {
+		ret->total = tmp_task->mm->total_vm;
+		ret->stack = tmp_task->mm->stack_vm;
+		ret->data = tmp_task->mm->data_vm;
+	}
+
+	ret->monitor = p_taskmonitor;
 
 	kref_init(&ret->ref);
 
@@ -297,175 +311,51 @@ err_pid_task:
 	return ret;
 }
 
-static int taskmonitor_start(struct task_monitor *p_taskmonitor)
-{
-	struct task_struct *tmp_thread;
-
-	if (p_taskmonitor->thread)
-		return 0; //Thread already running
-
-	tmp_thread = kthread_create(taskmonitor_threadfunc, p_taskmonitor,
-				    "taskmonitor_pid");
-	if (IS_ERR(tmp_thread))
-		return PTR_ERR(tmp_thread);
-
-	get_task_struct(tmp_thread);
-	wake_up_process(tmp_thread);
-
-	p_taskmonitor->thread = tmp_thread;
-
-	return 0;
-}
-
-static void taskmonitor_stop(struct task_monitor *p_taskmonitor)
-{
-	if (!p_taskmonitor->thread)
-		return;
-
-	kthread_stop(p_taskmonitor->thread);
-	put_task_struct(p_taskmonitor->thread);
-	p_taskmonitor->thread = NULL;
-}
-
 static int taskmonitor_threadfunc(void *arg)
 {
-	struct task_monitor *tmp_taskmonitor = arg;
+	struct taskmonitor_controller *tmp_controler = arg;
+	struct task_monitor *tmp_taskmonitor, *tmp_next;
 	struct task_sample *tmp_sample;
 
 	while (!kthread_should_stop()) {
-		tmp_sample = taskmonitor_new_sample(tmp_taskmonitor);
-		if (IS_ERR_OR_NULL(tmp_sample)) {
-			taskmonitor_unset_pid(tmp_taskmonitor);
-			return PTR_ERR(tmp_sample);
+		mutex_lock(&tmp_controler->mutex);
+
+		list_for_each_entry_safe(tmp_taskmonitor, tmp_next,
+					 &tmp_controler->list, list) {
+			tmp_sample = taskmonitor_new_sample(tmp_taskmonitor);
+			if (IS_ERR_OR_NULL(tmp_sample)) {
+				list_del(&tmp_taskmonitor->list);
+				continue;
+			}
+
+			mutex_lock(&tmp_taskmonitor->mutex);
+			taskmonitor_add_sample(tmp_taskmonitor, tmp_sample);
+			mutex_unlock(&tmp_taskmonitor->mutex);
+
+			taskmonitor_sample_put(tmp_sample);
 		}
-		taskmonitor_add_sample(tmp_taskmonitor, tmp_sample);
-		taskmonitor_sample_put(tmp_sample);
+
+		mutex_unlock(&tmp_controler->mutex);
+
+		// tmp_sample = taskmonitor_new_sample(tmp_taskmonitor);
+		// if (IS_ERR_OR_NULL(tmp_sample)) {
+		// 	taskmonitor_unset_pid(tmp_taskmonitor);
+		// 	return PTR_ERR(tmp_sample);
+		// }
+		// taskmonitor_add_sample(tmp_taskmonitor, tmp_sample);
+		// taskmonitor_sample_put(tmp_sample);
 		schedule_timeout_uninterruptible(msecs_to_jiffies(1000));
 	}
+
+	list_for_each_entry_safe(tmp_taskmonitor, tmp_next,
+				 &tmp_controler->list, list) {
+		mutex_lock(&tmp_taskmonitor->mutex);
+		list_del(&tmp_taskmonitor->list);
+		mutex_unlock(&tmp_taskmonitor->mutex);
+		taskmonitor_free(tmp_taskmonitor);
+	}
+
 	return 0;
-}
-
-static ssize_t sysfs_show_taskmonitor(struct kobject *p_kobject,
-				      struct kobj_attribute *p_attr,
-				      char *p_buf)
-{
-	int ret;
-	int offset;
-	int count = 0;
-	struct task_monitor *tmp_mon = glob_taskmonitor;
-	struct task_sample *tmp_sample;
-
-	char *tmpBuf = kzalloc(PAGE_SIZE * sizeof(char), GFP_KERNEL);
-	if (!tmpBuf) {
-		pr_err("Not enough memory for buffer");
-		return 0;
-	}
-
-	mutex_lock(&tmp_mon->mutex);
-
-	list_for_each_entry_reverse(tmp_sample, &tmp_mon->samples, list) {
-		ret = snprintf(
-			tmpBuf, PAGE_SIZE,
-			"pid %d usr %llu sys %llu vm_total %lu vm_stack %lu vm_data %lu\n",
-			pid_nr(tmp_mon->pid), tmp_sample->utime,
-			tmp_sample->stime, tmp_sample->total, tmp_sample->stack,
-			tmp_sample->data);
-
-		offset = count + ret;
-		if (offset > PAGE_SIZE - 1) {
-			break;
-		}
-		memcpy(p_buf + PAGE_SIZE - offset, tmpBuf, ret);
-		count += ret;
-	}
-
-	memmove(p_buf, p_buf + PAGE_SIZE - count, count);
-	p_buf[count] = '\0';
-
-	mutex_unlock(&tmp_mon->mutex);
-	kfree(tmpBuf);
-
-	return count;
-}
-
-static ssize_t sysfs_store_taskmonitor(struct kobject *p_kobject,
-				       struct kobj_attribute *p_attr,
-				       const char *p_buf, size_t p_count)
-{
-	int err;
-	struct task_monitor *tmp_taskmonitor = glob_taskmonitor;
-	if (sysfs_streq(p_buf, "start")) {
-		err = taskmonitor_start(tmp_taskmonitor);
-		if (err)
-			return err;
-
-		return p_count;
-	}
-
-	if (sysfs_streq(p_buf, "stop")) {
-		taskmonitor_stop(tmp_taskmonitor);
-		return p_count;
-	}
-
-	return -EINVAL;
-}
-
-static long ioctl_call(struct file *p_file, unsigned int p_cmd,
-		       unsigned long p_arg)
-{
-	int ret;
-	pid_t pid;
-	void __user *ptr = (void __user *)p_arg;
-	struct task_monitor *tmp_taskmonitor = glob_taskmonitor;
-	struct task_sample *tmp_sample;
-	char *ret_buffer;
-
-	switch (p_cmd) {
-	case TM_START:
-		return taskmonitor_start(tmp_taskmonitor);
-
-	case TM_STOP:
-		taskmonitor_stop(tmp_taskmonitor);
-		return 0;
-
-	case TM_GET:
-		tmp_sample = taskmonitor_new_sample(tmp_taskmonitor);
-		if (IS_ERR_OR_NULL(tmp_sample))
-			return tmp_sample ? PTR_ERR(tmp_sample) : -EINVAL;
-
-		ret_buffer = kzalloc(256 * sizeof(char), GFP_KERNEL);
-		if (!ret_buffer) {
-			taskmonitor_free_sample(tmp_sample);
-			return 0;
-		}
-
-		sprintf(ret_buffer, "pid %d usr %llu sys %llu",
-			pid_nr(tmp_taskmonitor->pid), tmp_sample->utime,
-			tmp_sample->stime);
-
-		ret = copy_to_user(ptr, ret_buffer, 256 * sizeof(char));
-		taskmonitor_free_sample(tmp_sample);
-		kfree(ret_buffer);
-		return ret;
-
-	case TM_PID:
-		ret = copy_from_user(&pid, ptr, sizeof(pid));
-		if (ret)
-			return ret;
-
-		if (pid < 0) {
-			if (!tmp_taskmonitor->pid)
-				return -EINVAL;
-
-			pid = pid_nr(tmp_taskmonitor->pid);
-			return copy_to_user(ptr, &pid, sizeof(pid));
-		} else {
-			return taskmonitor_set_pid(tmp_taskmonitor, pid);
-		}
-
-	default:
-		return -ENOTTY;
-	}
 }
 
 static unsigned long taskmonitor_count_objects(struct shrinker *p_sh,
@@ -521,6 +411,7 @@ static void taskmonitor_sample_get(struct task_sample *p_sample)
 {
 	kref_get(&p_sample->ref);
 }
+
 static int taskmonitor_sample_put(struct task_sample *p_sample)
 {
 	return kref_put(&p_sample->ref, taskmonitor_sample_release);
@@ -590,67 +481,108 @@ static int taskmonitor_open(struct inode *p_inode, struct file *p_file)
 	return 0;
 }
 
-module_param_named(target, target_param, int, 0660);
+static ssize_t taskmonitor_control_write(struct file *file, const char *buf,
+					 size_t len, loff_t *off)
+{
+	ssize_t ret;
+	struct taskmonitor_controller *tmp_controller = file->private_data;
+	struct task_monitor *tmp_monitor, *tmp_next;
+	char *pid_string;
+	pid_t pid;
+
+	pid_string = memdup_user_nul(buf, len);
+	if (IS_ERR(pid_string)) {
+		ret = PTR_ERR(pid_string);
+		goto err_usr_str;
+	}
+
+	ret = kstrtoint(pid_string, 0, &pid);
+	if (ret)
+		goto err_str_to_int;
+
+	mutex_lock(&tmp_controller->mutex);
+
+	if (pid > 0) {
+		tmp_monitor = taskmonitor_new(strim(pid_string),
+					      tmp_controller->root_dir);
+		if (IS_ERR(tmp_monitor)) {
+			ret = PTR_ERR(tmp_controller);
+			goto err_new_taskmon;
+		}
+
+		list_add(&tmp_monitor->list, &tmp_controller->list);
+
+		ret = len;
+	} else {
+		ret = -EINVAL;
+		list_for_each_entry_safe(tmp_monitor, tmp_next,
+					 &tmp_controller->list, list) {
+			if (pid_nr(tmp_monitor->pid) == -pid) {
+				list_del(&tmp_monitor->list);
+				taskmonitor_free(tmp_monitor);
+				ret = len;
+				break;
+			}
+		}
+	}
+
+err_new_taskmon:
+	mutex_unlock(&tmp_controller->mutex);
+
+err_str_to_int:
+	kfree(pid_string);
+
+err_usr_str:
+	return ret;
+}
 
 static int __init taskmonitor_init(void)
 {
 	int err;
-	struct task_monitor *monitor;
 
-	monitor = taskmonitor_new();
-	if (IS_ERR(monitor))
-		return PTR_ERR(monitor);
+	mutex_init(&monitor_controller.mutex);
+	INIT_LIST_HEAD(&monitor_controller.list);
 
-	taskmonitor_debugfs = debugfs_create_file(
-		"taskmonitor", 0444, NULL, monitor, &taskmonitor_debugfs_ops);
-	if (IS_ERR(taskmonitor_debugfs)) {
-		err = PTR_ERR(taskmonitor_debugfs);
-		goto err_monitor;
-	}
-
-	glob_taskmonitor = monitor;
-
-	if (target_param) {
-		err = taskmonitor_set_pid(monitor, target_param);
-		if (err)
-			goto err_debugfs;
-
-		err = taskmonitor_start(monitor);
-		if (err)
-			goto err_debugfs;
-	}
-
-	err = sysfs_create_file(kernel_kobj, &taskmonitor_attr.attr);
-	pr_info("Sysfs result %d", err);
-	if (err)
+	monitor_controller.root_dir = debugfs_create_dir("taskmonitor", NULL);
+	if (IS_ERR(monitor_controller.root_dir)) {
+		err = PTR_ERR(monitor_controller.root_dir);
 		goto err_debugfs;
-
-	major_number = register_chrdev(0, "taskmonitor", &taskmonitor_fops);
-	if (major_number < 0) {
-		err = major_number;
-		goto err_chrdev;
 	}
-	pr_info("Major number is: %d\n", major_number);
+
+	taskmonitor_thread = kthread_run(taskmonitor_threadfunc,
+					 &monitor_controller, "taskmonitor");
+	if (IS_ERR(taskmonitor_thread)) {
+		err = PTR_ERR(taskmonitor_thread);
+		goto err_thread;
+	}
+
+	taskmonitor_debugfs_control = debugfs_create_file(
+		"control", 0444, monitor_controller.root_dir,
+		&monitor_controller, &taskmonitor_control_fops);
+	if (IS_ERR(taskmonitor_debugfs_control)) {
+		err = PTR_ERR(taskmonitor_debugfs_control);
+		goto err_debugfs_file;
+	}
 
 	return 0;
 
-err_chrdev:
-	sysfs_remove_file(kernel_kobj, &taskmonitor_attr.attr);
+err_debugfs_file:
+	kthread_stop(taskmonitor_thread);
+
+err_thread:
+	debugfs_remove(monitor_controller.root_dir);
 
 err_debugfs:
-	debugfs_remove(taskmonitor_debugfs);
-
-err_monitor:
-	taskmonitor_free(monitor);
+	mutex_destroy(&monitor_controller.mutex);
 	return err;
 }
 
 static void __exit taskmonitor_exit(void)
 {
-	unregister_chrdev(major_number, "taskmonitor");
-	sysfs_remove_file(kernel_kobj, &taskmonitor_attr.attr);
-	debugfs_remove(taskmonitor_debugfs);
-	taskmonitor_free(glob_taskmonitor);
+	debugfs_remove(taskmonitor_debugfs_control);
+	kthread_stop(taskmonitor_thread);
+	debugfs_remove(monitor_controller.root_dir);
+	mutex_destroy(&monitor_controller.mutex);
 }
 
 module_init(taskmonitor_init);
