@@ -170,3 +170,6 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+# My custom suff **burp** :) / Philipp sagt nenn es LKP
+*.patch
