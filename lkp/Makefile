@@ -1,1 +1,1 @@
-obj-m += weasel.o
+obj-m += hide_pid.o
